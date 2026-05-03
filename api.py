@@ -1,11 +1,7 @@
 """Capabilities Hub FastAPI backend (WP-607a).
 
-Manages the tool inventory, validates capability availability, and exposes
-a stable ABI contract so downstream agents can consume specialised utilities
-without hard-coding paths.
-
-Role: Provisioner — surfaces required tooling, git helpers, merge utilities,
-and specialized capabilities ABI for multi-agent workflows.
+Role: Provisioner + Registry — surfaces tooling ABI and acts as the
+authoritative service registry for the SVAS fleet.
 
 Endpoints:
   GET  /health                              — liveness probe
@@ -13,6 +9,10 @@ Endpoints:
   GET  /api/v1/capabilities/inventory       — list available capabilities
   GET  /api/v1/capabilities/provisions      — list provision requests
   GET  /api/v1/capabilities/audit           — provision audit log
+  POST /registry/register                   — register an arm/service
+  POST /registry/recommend                  — recommend arms for an intent
+  GET  /registry/gaps                       — identify coverage gaps
+  GET  /registry/health                     — health of all registered services
 
 Configuration (env vars):
   OPENROUTER_API_KEY    — LLM for capability matching
@@ -65,7 +65,7 @@ def _init_db():
             provision_id  TEXT PRIMARY KEY,
             workflow_id   TEXT,
             intent        TEXT,
-            matched_caps  TEXT,  -- JSON array of capability ids
+            matched_caps  TEXT,
             status        TEXT DEFAULT 'provisioned',
             created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
@@ -75,6 +75,17 @@ def _init_db():
             action      TEXT,
             details     TEXT,
             timestamp   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS registry (
+            arm_key     TEXT PRIMARY KEY,
+            label       TEXT,
+            service_url TEXT,
+            domain      TEXT,
+            keywords    TEXT,
+            priority    INTEGER DEFAULT 50,
+            status      TEXT DEFAULT 'registered',
+            registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_seen   TIMESTAMP
         );
     """)
     conn.commit()
@@ -231,6 +242,139 @@ def audit(limit: int = 100):
         (limit,),
     )
     return {"entries": rows, "count": len(rows)}
+
+
+# ── Registry schemas ──────────────────────────────────────────────────────────
+
+class RegisterRequest(BaseModel):
+    arm_key: str
+    label: str
+    service_url: str
+    domain: str
+    keywords: list[str] = []
+    priority: int = 50
+
+
+class RecommendRequest(BaseModel):
+    intent: str
+    workflow_id: str = ""
+    top_k: int = 3
+
+
+class RecommendMatch(BaseModel):
+    arm_key: str
+    label: str
+    service_url: str
+    domain: str
+    confidence: float
+    reason: str
+
+
+# ── Registry endpoints ────────────────────────────────────────────────────────
+
+@app.post("/registry/register")
+def registry_register(req: RegisterRequest):
+    import json
+    conn = sqlite3.connect(_DB)
+    now = datetime.utcnow().isoformat()
+    conn.execute(
+        """INSERT INTO registry (arm_key, label, service_url, domain, keywords, priority, last_seen)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(arm_key) DO UPDATE SET
+             label=excluded.label, service_url=excluded.service_url,
+             domain=excluded.domain, keywords=excluded.keywords,
+             priority=excluded.priority, last_seen=excluded.last_seen, status='registered'""",
+        (req.arm_key, req.label, req.service_url, req.domain,
+         json.dumps(req.keywords), req.priority, now),
+    )
+    conn.commit()
+    conn.close()
+    logger.info("Registry: arm '%s' registered — %s", req.arm_key, req.service_url)
+    return {"status": "registered", "arm_key": req.arm_key, "registered_at": now}
+
+
+@app.post("/registry/recommend")
+def registry_recommend(req: RecommendRequest):
+    import json
+    rows = _db_query(
+        "SELECT arm_key, label, service_url, domain, keywords, priority FROM registry WHERE status='registered'",
+    )
+    intent_lower = req.intent.lower()
+    scored: list[tuple[float, dict]] = []
+    for row in rows:
+        kws = json.loads(row.get("keywords") or "[]")
+        hits = sum(1 for k in kws if k.lower() in intent_lower)
+        if hits == 0:
+            continue
+        conf = min(1.0, round(hits / max(len(kws), 1), 2))
+        scored.append((conf, row, hits))
+
+    scored.sort(key=lambda x: (x[0], x[2]), reverse=True)
+    results = []
+    for conf, row, hits in scored[: req.top_k]:
+        results.append(RecommendMatch(
+            arm_key=row["arm_key"],
+            label=row["label"],
+            service_url=row["service_url"],
+            domain=row["domain"],
+            confidence=conf,
+            reason=f"{hits} keyword(s) matched in intent",
+        ))
+
+    logger.info("[%s] Recommend: %d arms matched for intent", req.workflow_id, len(results))
+    return {
+        "workflow_id": req.workflow_id,
+        "intent_snippet": req.intent[:80],
+        "recommendations": [r.model_dump() for r in results],
+        "count": len(results),
+    }
+
+
+@app.get("/registry/gaps")
+def registry_gaps():
+    rows = _db_query("SELECT domain, COUNT(*) as cnt FROM registry WHERE status='registered' GROUP BY domain")
+    covered = {r["domain"] for r in rows}
+    all_domains = {"compliance", "governance", "ml-ops", "change-mgmt", "data-quality",
+                   "security", "infrastructure", "project-mgmt", "knowledge", "analytics"}
+    gaps = sorted(all_domains - covered)
+    return {
+        "covered_domains": sorted(covered),
+        "gap_domains": gaps,
+        "coverage_pct": round(len(covered) / len(all_domains) * 100, 1),
+        "registered_arms": len(_db_query("SELECT arm_key FROM registry WHERE status='registered'")),
+    }
+
+
+@app.get("/registry/health")
+def registry_health():
+    import json, urllib.request
+    rows = _db_query(
+        "SELECT arm_key, label, service_url, last_seen FROM registry WHERE status='registered'",
+    )
+    results = []
+    for row in rows:
+        url = row["service_url"].rstrip("/") + "/health" if row["service_url"] else ""
+        status = "unknown"
+        if url:
+            try:
+                with urllib.request.urlopen(url, timeout=4) as resp:
+                    status = "healthy" if resp.status == 200 else f"http-{resp.status}"
+            except Exception:
+                status = "unreachable"
+        results.append({
+            "arm_key": row["arm_key"],
+            "label": row["label"],
+            "service_url": row["service_url"],
+            "health": status,
+            "last_seen": row["last_seen"],
+        })
+    healthy = sum(1 for r in results if r["health"] == "healthy")
+    return {
+        "arms": results,
+        "healthy": healthy,
+        "total": len(results),
+        "hub_status": "healthy",
+    }
 
 
 if __name__ == "__main__":

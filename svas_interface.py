@@ -1,165 +1,95 @@
-"""SVAS → Capabilities Hub bridge (WP-607a).
+"""SVAS → Capabilities Hub — live service registry + provisioning.
 
-Translates a SVAS intent into a Capabilities Hub provision request by calling
-the live Capabilities Hub API at /api/v1/capabilities/provision, then maps the
-response back to the SVAS sub-agent tuple format: (analysis_reasoning,
-target_agent, steps).
-
-Role: Provisioner — surfaces required tooling, git helpers, merge utilities,
-and specialized capabilities ABI for multi-agent workflows.  The Hub manages
-tool inventory, validates availability, and exposes a stable ABI contract so
-downstream agents can consume specialised utilities without hard-coding paths.
-
-Flow:
-  1. TCP probe  → is Capabilities Hub process running?
-  2. GET /health → confirm API is healthy (not just the port)
-  3. POST /api/v1/capabilities/provision  → submit intent as provision request
-  4. Map response to (analysis, agent_name, steps)
-  5. Deterministic mock fallback when Hub offline or Temporal not connected
-
-Configuration (env vars):
-  CAPHUB_API_URL  — default http://localhost:8007
-  CAPHUB_TIMEOUT  — HTTP timeout in seconds, default 5
+Primary:  POST {CAPHUB_URL}/registry/recommend  — intent-to-arm recommendation
+          POST {CAPHUB_URL}/api/v1/capabilities/provision — provision capabilities
+Fallback: Claude AI advisory via OpenRouter.
+Env var:  CAPHUB_URL
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
-import socket
-from urllib.error import URLError
-from urllib.request import Request, urlopen
+import sys
 
-logger = logging.getLogger("SVAS_CapHub_Bridge")
+logger = logging.getLogger("SVAS_CapHub")
 
-# ── Configuration ─────────────────────────────────────────────────────────────
+_CORPORATE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _CORPORATE not in sys.path:
+    sys.path.insert(0, _CORPORATE)
 
-_CAPHUB_BASE = os.getenv("CAPHUB_API_URL", "http://localhost:8007").rstrip("/")
-_TIMEOUT     = float(os.getenv("CAPHUB_TIMEOUT", "5"))
+from ai_executor import execute_agent_task, enhanced_fallback, call_service
 
-# ── Connectivity probes ────────────────────────────────────────────────────────
+_AGENT_NAME  = "Capabilities Hub (Service Registry)"
+_SERVICE_URL = os.getenv("CAPHUB_URL", "").rstrip("/")
 
-def _is_caphub_reachable() -> bool:
-    """TCP probe — fast check before making HTTP calls."""
-    try:
-        url = _CAPHUB_BASE.replace("http://", "").replace("https://", "")
-        host, _, port_str = url.partition(":")
-        port = int(port_str) if port_str else 80
-        with socket.create_connection((host, port), timeout=1):
-            return True
-    except Exception:
-        return False
+_SYSTEM_PROMPT = """
+You are the Capabilities Hub — the tooling and capability provisioning AI agent
+in the SVAS fleet. You identify and coordinate the tools, SDKs, APIs, and
+infrastructure capabilities needed to execute intents.
 
+For the given intent, produce:
+- Required capabilities: what specific tools, libraries, APIs, services, or
+  infrastructure components are needed? List with version constraints if relevant.
+- Availability assessment: categorise each as AVAILABLE (in fleet), NEEDS
+  PROVISIONING, or BLOCKED (requires procurement/approval).
+- Provisioning plan: for capabilities marked NEEDS PROVISIONING, what are the
+  setup steps? Consider cost (zero-cost directive applies), time, and dependencies.
+- ABI / interface contract: what interfaces or contracts must be exposed for
+  downstream agents to consume these capabilities?
+- Gaps: what capabilities are missing from the fleet that cannot be self-provisioned?
 
-def _is_caphub_healthy() -> bool:
-    """GET /health — confirm the API layer is fully up."""
-    try:
-        req = Request(f"{_CAPHUB_BASE}/health", method="GET")
-        with urlopen(req, timeout=_TIMEOUT) as resp:
-            data = json.loads(resp.read().decode())
-            return data.get("status") in ("healthy", "ok", "OK", "operational")
-    except Exception:
-        return False
+analysis must reference the specific tools/capabilities implied by the intent.
+Steps must represent real capability identification and provisioning workflow stages.
+"""
 
-
-# ── API call ──────────────────────────────────────────────────────────────────
-
-def _submit_provision_request(intent: str, workflow_id: str) -> dict | None:
-    """POST /api/v1/capabilities/provision and return parsed JSON, or None on error."""
-    try:
-        body = json.dumps({
-            "intent":      intent,
-            "workflow_id": f"svas-{workflow_id}",
-        }).encode()
-        req = Request(
-            f"{_CAPHUB_BASE}/api/v1/capabilities/provision",
-            data=body,
-            method="POST",
-            headers={"Content-Type": "application/json"},
-        )
-        with urlopen(req, timeout=_TIMEOUT) as resp:
-            return json.loads(resp.read().decode())
-    except Exception as exc:
-        logger.warning("Capabilities Hub provision request failed: %s", exc)
-        return None
-
-
-# ── Response → SVAS translation ───────────────────────────────────────────────
-
-def _response_to_svas(
-    response: dict,
-    intent: str,
-    workflow_id: str,
-) -> tuple[str, str, list]:
-    """Translate a Capabilities Hub /provision response to SVAS tuple format."""
-    status      = response.get("status", "submitted")
-    wf_id       = response.get("workflowId", workflow_id)
-    temporal_up = status == "submitted"
-
-    analysis = (
-        f"Capabilities Hub Provisioning (workflow={wf_id}, "
-        f"temporal={'connected' if temporal_up else 'offline'}):\n"
-        f"  Provision request submitted for tool surfacing and ABI exposure."
-    )
-
-    if temporal_up:
-        steps = [
-            {"id": "s1", "label": "CapHub: Identify Required Utilities"},
-            {"id": "s2", "label": "CapHub: Validate Tool Availability"},
-            {"id": "s3", "label": "CapHub: Provision Specialized Toolchain"},
-            {"id": "s4", "label": "CapHub: Expose Capabilities ABI"},
-        ]
-    else:
-        steps = [
-            {"id": "s1", "label": "Identify Required Utilities (local)"},
-            {"id": "s2", "label": "Provision Specialized Tools (local)"},
-            {"id": "s3", "label": "Expose Capabilities ABI (local)"},
-        ]
-
-    return analysis, "Capabilities Hub", steps
-
-
-# ── Mock fallback ─────────────────────────────────────────────────────────────
-
-def _mock_response(intent: str, workflow_id: str, reason: str) -> tuple[str, str, list]:
-    """Deterministic fallback when Capabilities Hub is offline."""
-    logger.info("[%s] Capabilities Hub bridge using mock fallback: %s", workflow_id, reason)
-    return (
-        f"Capabilities Hub (offline — {reason}): "
-        f"Surfacing required tooling for intent '{intent[:60]}'.",
-        "Capabilities Hub",
-        [
-            {"id": "s1", "label": "Identify Required Utilities (local)"},
-            {"id": "s2", "label": "Provision Specialized Tools (local)"},
-            {"id": "s3", "label": "Expose Capabilities ABI (local)"},
-        ],
-    )
-
-
-# ── Public SVAS interface ─────────────────────────────────────────────────────
 
 def analyze_intent(
     workflow_id: str,
     intent: str,
     context: dict | None = None,
 ) -> tuple[str, str, list]:
-    """
-    Primary SVAS entry-point for Capabilities Hub persona.
+    context = context or {}
 
-    1. TCP probe — fast check if Capabilities Hub is listening.
-    2. GET /health — confirm API is healthy.
-    3. POST /api/v1/capabilities/provision — submit the intent as a provision request.
-    4. Translate response to (analysis, agent_name, steps).
-    5. Fallback to deterministic mock if any step fails.
-    """
-    if not _is_caphub_reachable():
-        return _mock_response(intent, workflow_id, reason=f"Capabilities Hub not reachable at {_CAPHUB_BASE}")
+    if _SERVICE_URL:
+        try:
+            # First: get arm recommendations from the registry
+            rec_data = call_service(
+                f"{_SERVICE_URL}/registry/recommend",
+                {"intent": intent, "workflow_id": workflow_id, "top_k": 3},
+            )
+            recommendations = rec_data.get("recommendations", [])
 
-    if not _is_caphub_healthy():
-        return _mock_response(intent, workflow_id, reason="Capabilities Hub /health returned unhealthy")
+            # Then: provision capabilities for this workflow
+            prov_data = call_service(
+                f"{_SERVICE_URL}/api/v1/capabilities/provision",
+                {"intent": intent, "workflow_id": workflow_id, "context": context},
+            )
+            prov_id   = prov_data.get("provision_id", "")
+            caps      = prov_data.get("capabilities_provisioned", [])
+            abi       = prov_data.get("abi_contract", "")
 
-    response = _submit_provision_request(intent, workflow_id)
-    if response is None:
-        return _mock_response(intent, workflow_id, reason="provision request call failed")
+            rec_labels = [r.get("label", r.get("arm_key", "")) for r in recommendations]
+            analysis = (
+                f"Capabilities Hub provision {prov_id} complete for workflow {workflow_id}. "
+                f"{len(caps)} tool(s) provisioned. "
+                f"Registry recommends: {', '.join(rec_labels) or 'no specific arms matched'}. "
+                f"{abi[:100]}"
+            )
+            steps = [
+                {"id": "s1", "label": f"Provision {prov_id} — {len(caps)} capability(ies)"},
+                {"id": "s2", "label": f"Registry: {len(recommendations)} arm(s) recommended"},
+            ] + [
+                {"id": f"s{i+3}", "label": f"Arm: {r.get('label','')} ({r.get('domain','')} — {int(r.get('confidence',0)*100)}%)"}
+                for i, r in enumerate(recommendations[:3])
+            ]
+            logger.info("[%s] CapHub real execution OK — prov=%s caps=%d", workflow_id, prov_id, len(caps))
+            return analysis, _AGENT_NAME, steps
+        except Exception as exc:
+            logger.warning("[%s] CapHub service unreachable (%s) — AI fallback", workflow_id, exc)
 
-    return _response_to_svas(response, intent, workflow_id)
+    try:
+        result = execute_agent_task(_SYSTEM_PROMPT, intent, workflow_id, "capabilities_hub")
+        return result["analysis"], _AGENT_NAME, result["steps"]
+    except Exception as exc:
+        logger.error("[%s] CapHub AI execution failed: %s", workflow_id, exc)
+        return enhanced_fallback(_AGENT_NAME, "capabilities_hub", intent, workflow_id, str(exc))
